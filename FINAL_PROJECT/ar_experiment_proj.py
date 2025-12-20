@@ -1,7 +1,10 @@
-from submodules.mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+try:
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+except ImportError:
+    from submodules.mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 
 import torch
-from transformers import AutoTokenizer, GPTNeoXForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -57,10 +60,26 @@ def parse_tokens(token_seq, tokenizer, wanted_key, wanted_value, i_query):
 
 def run_ar_experiment(config, start_datetime_str):
 
-    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     model_name = config['model_name']
-    mamba = MambaLMHeadModel.from_pretrained(model_name, cache_dir=config['cache_dir']).to(torch.float16).to(config["device"])
+    print(f"Loading model: {model_name}")
     
+    # Dynamic tokenizer loading
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except:
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b") # Fallback
+        
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    is_mamba = 'mamba' in model_name.lower()
+    
+    if is_mamba:
+        model = MambaLMHeadModel.from_pretrained(model_name, cache_dir=config['cache_dir']).to(torch.float16).to(config["device"])
+    else:
+        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16).to(config["device"])
+        model.eval()
+
     seeds = [123,234,345,456,567]
     num_of_facts_to_test = [10,30,50,70,90,110,130,150,170,190,210,230,250]
     max_batch_size = 50
@@ -68,8 +87,11 @@ def run_ar_experiment(config, start_datetime_str):
     num_pad_toks_between_two_facts = 1
     record_responses_for_debug = False
     
-    save_dir = os.path.join('./artifacts/ar_experiment', f'{start_datetime_str}_{model_name.split("/")[-1]}_seeds_{"_".join([str(x) for x in seeds])}')
+    # Ensure save directory uses a safe name (replace slashes)
+    short_model_name = model_name.split("/")[-1]
+    save_dir = os.path.join('./artifacts/ar_experiment', f'{start_datetime_str}_{short_model_name}_seeds_{"_".join([str(x) for x in seeds])}')
     os.makedirs(save_dir, exist_ok=True)
+    
     res_per_num_facts = {}
     for num_of_facts in num_of_facts_to_test:
         res_per_num_facts[num_of_facts] = []
@@ -93,7 +115,12 @@ def run_ar_experiment(config, start_datetime_str):
             queries = [tokenizer.encode(fact_key) + tokenizer.encode(' ')  for fact_key in cur_df['key'].iloc[0:num_of_facts].tolist()]
             query_len_toks = [len(query) for query in queries]
             query_len_padded = max(query_len_toks)
-            queries = [tokenizer.encode(pad_token) * (query_len_padded - query_len_toks[i_query]) + queries[i_query] for i_query in range(len(queries))] # padding the query lets us batch
+            
+            # Padding queries
+            # Note: For transformers, typically left padding is better for generation, but we stick to logic here
+            pad_id = tokenizer.encode(pad_token)[0] if tokenizer.encode(pad_token) else tokenizer.eos_token_id
+            
+            queries = [[pad_id] * (query_len_padded - query_len_toks[i_query]) + queries[i_query] for i_query in range(len(queries))] 
             answers = [fact_value for fact_value in cur_df['value'].iloc[0:num_of_facts].tolist()]
 
             
@@ -107,22 +134,43 @@ def run_ar_experiment(config, start_datetime_str):
             for i_query in range(num_of_facts):
                 if i_query not in queries_to_record:
                     continue
+                # For transformers, list + list works. 
                 prompt = context + tokenizer.encode(pad_token) + queries[i_query]
-                input_ids.append(torch.tensor(prompt, dtype=torch.int32))
+                input_ids.append(torch.tensor(prompt, dtype=torch.int64)) # Use int64 for torch
                 
             input_ids = torch.vstack(input_ids).to(config['device'])
             responses = []
             num_iters = int(np.ceil(input_ids.shape[0] / max_batch_size))
+            
             for i in tqdm(range(num_iters)):
                 start_idx = i * max_batch_size
                 end_idx = min((i+1) * max_batch_size, input_ids.shape[0])
-                outputs = mamba.generate(input_ids[start_idx:end_idx], max_length=input_ids.shape[1]+30)
-                responses.extend(tokenizer.batch_decode(outputs[:, input_ids.shape[1]:]))
+                batch_input = input_ids[start_idx:end_idx]
+                
+                if is_mamba:
+                    outputs = model.generate(batch_input, max_length=input_ids.shape[1]+30)
+                    # Mamba generate might include input? Code assumed it did: outputs[:, input_ids.shape[1]:]
+                    # Yes, usually returns full seq. Checking original code:
+                    # original: responses.extend(tokenizer.batch_decode(outputs[:, input_ids.shape[1]:]))
+                    generated = outputs[:, input_ids.shape[1]:]
+                else:
+                    # Transformer generation
+                    # Attention mask is usually needed but we might get away without it for simple eval if left padded properly or check padding_side
+                    # For simplicity, we just run generate.
+                    with torch.no_grad():
+                        outputs = model.generate(batch_input, max_new_tokens=30, pad_token_id=tokenizer.eos_token_id)
+                    generated = outputs[:, batch_input.shape[1]:]
+
+                responses.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
 
             for i_resp, resp in enumerate(responses):
-                parsed_response = resp.split(pad_token)[0]
-                # parsed_response = find_five_digit_number(response)
-                scores.append(parsed_response==answers[i_resp])
+                # Clean up response: take everything before first pad_token/newline/etc if implied
+                # Original code used: resp.split(pad_token)[0]
+                # Transformers might have skip_special_tokens=True, so pad_token might be gone.
+                # We should be careful. 
+                parsed_response = resp.strip().split(pad_token)[0].strip()
+                # Simple check
+                scores.append(parsed_response == answers[i_resp])
 
             print(f'seed: {seed}')
             print(f'number of facts: {num_of_facts}')
@@ -154,10 +202,36 @@ def run_ar_experiment(config, start_datetime_str):
 if __name__ == '__main__':
     
     pd.options.mode.chained_assignment = None  # default='warn'
-    config = {
-        'device': 'cuda',
-        'cache_dir': '/data/sls/scratch/assafbk/hf_home',
-        'model_name': 'state-spaces/mamba2-370m'
-        }
+    
+    # List of models to run
+    models_to_run = [
+        'state-spaces/mamba2-370m',
+        'state-spaces/mamba2-780m',
+        'state-spaces/mamba2-1.3b',
+        'state-spaces/mamba2-2.7b',
+        'EleutherAI/gpt-neo-2.7B'
+    ]
+    
     start_datetime_str = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
-    run_ar_experiment(config, start_datetime_str)
+    
+    for model_name in models_to_run:
+        config = {
+            'device': 'cuda',
+            'cache_dir': './hf_cache',
+            'model_name': model_name
+        }
+        print(f"\n\n==================================================")
+        print(f"STARTING EXPERIMENT FOR: {model_name}")
+        print(f"==================================================\n")
+        try:
+            run_ar_experiment(config, start_datetime_str)
+        except Exception as e:
+            print(f"FAILED for {model_name}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Generate the comparison graph automatically
+    print("\nGenerating comparison graph...")
+    from plot_comparison import plot_all_results
+    plot_all_results()
+

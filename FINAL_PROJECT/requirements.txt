@@ -1,0 +1,10 @@
+torch
+transformers
+pandas
+numpy
+tqdm
+tabulate
+wandb
+matplotlib
+causal-conv1d>=1.2.0
+mamba-ssm
