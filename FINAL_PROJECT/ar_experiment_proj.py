@@ -1,3 +1,5 @@
+import os
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 try:
     from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 except ImportError:
@@ -11,6 +13,7 @@ import pandas as pd
 from tqdm import tqdm
 from tabulate import tabulate
 import re
+import gc
 
 from utils import *
 
@@ -75,14 +78,29 @@ def run_ar_experiment(config, start_datetime_str):
     is_mamba = 'mamba' in model_name.lower()
     
     if is_mamba:
-        model = MambaLMHeadModel.from_pretrained(model_name, cache_dir=config['cache_dir']).to(torch.float16).to(config["device"])
+        # NOTE: MambaLMHeadModel.from_pretrained passes kwargs to the class __init__, 
+        # and some versions don't accept cache_dir in __init__. 
+        # The cache_dir is used by the internal loading mechanism but we can rely on default or set it globally if needed.
+        # For now, we remove it to fix the TypeError.
+        model = MambaLMHeadModel.from_pretrained(model_name).to(torch.float16).to(config["device"])
     else:
         model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16).to(config["device"])
         model.eval()
 
     seeds = [123,234,345,456,567]
     num_of_facts_to_test = [10,30,50,70,90,110,130,150,170,190,210,230,250]
-    max_batch_size = 50
+    
+    # Dynamic batch size: Mamba is memory efficient, Transformer needs small batches on T4/L4 GPUs
+    if is_mamba:
+        if '2.7b' in model_name.lower():
+            max_batch_size = 8 # Conservative batch size for 2.7B
+        elif '1.3b' in model_name.lower():
+            max_batch_size = 20
+        else:
+            max_batch_size = 50
+    else:
+        max_batch_size = 4
+    
     pad_token = '\n\n\n' 
     num_pad_toks_between_two_facts = 1
     record_responses_for_debug = False
@@ -93,110 +111,111 @@ def run_ar_experiment(config, start_datetime_str):
     os.makedirs(save_dir, exist_ok=True)
     
     res_per_num_facts = {}
-    for num_of_facts in num_of_facts_to_test:
-        res_per_num_facts[num_of_facts] = []
+    try:
+        for num_of_facts in num_of_facts_to_test:
+            res_per_num_facts[num_of_facts] = []
 
-    for seed in seeds:
-        ar_df = pd.read_csv('./ar_data.csv', dtype = str)
-        ar_df = ar_df.sample(frac=1,random_state=seed) # shuffle the data to get a random AR sequence for each seed
-        
-        start_fact_idx = 0
-        end_fact_idx = 0
-        for num_of_facts in num_of_facts_to_test: # number of 'facts' in the context
-
-            # Generate Shared Context
-            start_fact_idx = end_fact_idx
-            end_fact_idx = end_fact_idx + num_of_facts
-
-            cur_df = ar_df.iloc[start_fact_idx:end_fact_idx]
-            context = []
-            for i_fact, fact in cur_df.iterrows():
-                context += tokenizer.encode(fact["key"]) + tokenizer.encode(' ') + tokenizer.encode(fact["value"]) + num_pad_toks_between_two_facts * tokenizer.encode(pad_token)
-            queries = [tokenizer.encode(fact_key) + tokenizer.encode(' ')  for fact_key in cur_df['key'].iloc[0:num_of_facts].tolist()]
-            query_len_toks = [len(query) for query in queries]
-            query_len_padded = max(query_len_toks)
+        for seed in seeds:
+            ar_df = pd.read_csv('./ar_data.csv', dtype = str)
+            ar_df = ar_df.sample(frac=1,random_state=seed) # shuffle the data to get a random AR sequence for each seed
             
-            # Padding queries
-            # Note: For transformers, typically left padding is better for generation, but we stick to logic here
-            pad_id = tokenizer.encode(pad_token)[0] if tokenizer.encode(pad_token) else tokenizer.eos_token_id
-            
-            queries = [[pad_id] * (query_len_padded - query_len_toks[i_query]) + queries[i_query] for i_query in range(len(queries))] 
-            answers = [fact_value for fact_value in cur_df['value'].iloc[0:num_of_facts].tolist()]
+            start_fact_idx = 0
+            end_fact_idx = 0
+            for num_of_facts in num_of_facts_to_test: # number of 'facts' in the context
 
-            
-            # Evaluate over all possible queries
-            print(f'############### num of facts: {num_of_facts} ################')
-            scores = []
+                # Generate Shared Context
+                start_fact_idx = end_fact_idx
+                end_fact_idx = end_fact_idx + num_of_facts
 
-            # queries_to_record = [10] # 30 facts
-            queries_to_record = [x for x in range(num_of_facts)] # all facts
-            input_ids = []
-            for i_query in range(num_of_facts):
-                if i_query not in queries_to_record:
-                    continue
-                # For transformers, list + list works. 
-                prompt = context + tokenizer.encode(pad_token) + queries[i_query]
-                input_ids.append(torch.tensor(prompt, dtype=torch.int64)) # Use int64 for torch
+                cur_df = ar_df.iloc[start_fact_idx:end_fact_idx]
+                context = []
+                for i_fact, fact in cur_df.iterrows():
+                    context += tokenizer.encode(fact["key"]) + tokenizer.encode(' ') + tokenizer.encode(fact["value"]) + num_pad_toks_between_two_facts * tokenizer.encode(pad_token)
+                queries = [tokenizer.encode(fact_key) + tokenizer.encode(' ')  for fact_key in cur_df['key'].iloc[0:num_of_facts].tolist()]
+                query_len_toks = [len(query) for query in queries]
+                query_len_padded = max(query_len_toks)
                 
-            input_ids = torch.vstack(input_ids).to(config['device'])
-            responses = []
-            num_iters = int(np.ceil(input_ids.shape[0] / max_batch_size))
-            
-            for i in tqdm(range(num_iters)):
-                start_idx = i * max_batch_size
-                end_idx = min((i+1) * max_batch_size, input_ids.shape[0])
-                batch_input = input_ids[start_idx:end_idx]
+                # Padding queries
+                # Note: For transformers, typically left padding is better for generation, but we stick to logic here
+                pad_id = tokenizer.encode(pad_token)[0] if tokenizer.encode(pad_token) else tokenizer.eos_token_id
                 
-                if is_mamba:
-                    outputs = model.generate(batch_input, max_length=input_ids.shape[1]+30)
-                    # Mamba generate might include input? Code assumed it did: outputs[:, input_ids.shape[1]:]
-                    # Yes, usually returns full seq. Checking original code:
-                    # original: responses.extend(tokenizer.batch_decode(outputs[:, input_ids.shape[1]:]))
-                    generated = outputs[:, input_ids.shape[1]:]
-                else:
-                    # Transformer generation
-                    # Attention mask is usually needed but we might get away without it for simple eval if left padded properly or check padding_side
-                    # For simplicity, we just run generate.
+                queries = [[pad_id] * (query_len_padded - query_len_toks[i_query]) + queries[i_query] for i_query in range(len(queries))] 
+                answers = [fact_value for fact_value in cur_df['value'].iloc[0:num_of_facts].tolist()]
+
+                
+                # Evaluate over all possible queries
+                print(f'############### num of facts: {num_of_facts} ################')
+                scores = []
+
+                # queries_to_record = [10] # 30 facts
+                queries_to_record = [x for x in range(num_of_facts)] # all facts
+                input_ids = []
+                for i_query in range(num_of_facts):
+                    if i_query not in queries_to_record:
+                        continue
+                    # For transformers, list + list works. 
+                    prompt = context + tokenizer.encode(pad_token) + queries[i_query]
+                    input_ids.append(torch.tensor(prompt, dtype=torch.int64)) # Use int64 for torch
+                    
+                input_ids = torch.vstack(input_ids) # Keep on CPU until batching
+                responses = []
+                num_iters = int(np.ceil(input_ids.shape[0] / max_batch_size))
+                
+                for i in tqdm(range(num_iters)):
+                    start_idx = i * max_batch_size
+                    end_idx = min((i+1) * max_batch_size, input_ids.shape[0])
+                    batch_input = input_ids[start_idx:end_idx].to(config['device'])
+                    
                     with torch.no_grad():
-                        outputs = model.generate(batch_input, max_new_tokens=30, pad_token_id=tokenizer.eos_token_id)
-                    generated = outputs[:, batch_input.shape[1]:]
+                        if is_mamba:
+                            # Use max_length that accounts for input + new tokens (30 new tokens approx)
+                            outputs = model.generate(batch_input, max_length=input_ids.shape[1]+30)
+                            generated = outputs[:, input_ids.shape[1]:]
+                        else:
+                            # Transformer generation
+                            outputs = model.generate(batch_input, max_new_tokens=30, pad_token_id=tokenizer.eos_token_id)
+                            generated = outputs[:, batch_input.shape[1]:]
 
-                responses.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
+                    responses.extend(tokenizer.batch_decode(generated, skip_special_tokens=True))
 
-            for i_resp, resp in enumerate(responses):
-                # Clean up response: take everything before first pad_token/newline/etc if implied
-                # Original code used: resp.split(pad_token)[0]
-                # Transformers might have skip_special_tokens=True, so pad_token might be gone.
-                # We should be careful. 
-                parsed_response = resp.strip().split(pad_token)[0].strip()
-                # Simple check
-                scores.append(parsed_response == answers[i_resp])
+                for i_resp, resp in enumerate(responses):
+                    # Clean up response: take everything before first pad_token/newline/etc if implied
+                    parsed_response = resp.strip().split(pad_token)[0].strip()
+                    # Simple check
+                    scores.append(parsed_response == answers[i_resp])
 
-            print(f'seed: {seed}')
-            print(f'number of facts: {num_of_facts}')
-            print(f'number of hits: {np.array(scores).sum()}')
-            print(f'accuracy: {np.array(scores).sum() / num_of_facts:.2f}')
-            print(f'context length: {input_ids.shape[1]}')
+                print(f'seed: {seed}')
+                print(f'number of facts: {num_of_facts}')
+                print(f'number of hits: {np.array(scores).sum()}')
+                print(f'accuracy: {np.array(scores).sum() / num_of_facts:.2f}')
+                print(f'context length: {input_ids.shape[1]}')
 
-            # save results 
-            res_per_num_facts[num_of_facts].append(int(np.array(scores).sum()))
-            results_file_name = f'final_results.json'
-            save_path_results = os.path.join(save_dir, results_file_name)
-            with open(save_path_results, 'w') as f:       
-                json.dump(res_per_num_facts, f) 
+                # save results 
+                res_per_num_facts[num_of_facts].append(int(np.array(scores).sum()))
+                results_file_name = f'final_results.json'
+                save_path_results = os.path.join(save_dir, results_file_name)
+                with open(save_path_results, 'w') as f:       
+                    json.dump(res_per_num_facts, f) 
 
-            if record_responses_for_debug: 
-                cur_df = cur_df.iloc[queries_to_record]
-                cur_df['scores'] = scores
-                cur_df.num_of_tokens = input_ids.shape[1]
-                file_name = f'num_facts_{num_of_facts}.csv'
-                save_path = os.path.join(save_dir, file_name)
-                cur_df.to_csv(save_path, index=False)
-    
-    print(f'Final results over {len(seeds)} seeds - num hits:')
-    print(tabulate([['num hits:'] + [f'{np.mean(v):.2f}' for v in res_per_num_facts.values()]], headers=['num facts:'] + [f'{k}' for k in res_per_num_facts.keys()] , tablefmt='pretty'))
-    print(f'\nFinal results over {len(seeds)} seeds - accuracy:')
-    print(tabulate([['accuracy:'] + [f'{np.mean(v)/k:.2f}' for k,v in res_per_num_facts.items()]], headers=['num facts:'] + [f'{k}' for k in res_per_num_facts.keys()] , tablefmt='pretty'))
+                if record_responses_for_debug: 
+                    cur_df = cur_df.iloc[queries_to_record]
+                    cur_df['scores'] = scores
+                    cur_df.num_of_tokens = input_ids.shape[1]
+                    file_name = f'num_facts_{num_of_facts}.csv'
+                    save_path = os.path.join(save_dir, file_name)
+                    cur_df.to_csv(save_path, index=False)
+        
+        print(f'Final results over {len(seeds)} seeds - num hits:')
+        print(tabulate([['num hits:'] + [f'{np.mean(v):.2f}' for v in res_per_num_facts.values()]], headers=['num facts:'] + [f'{k}' for k in res_per_num_facts.keys()] , tablefmt='pretty'))
+        print(f'\nFinal results over {len(seeds)} seeds - accuracy:')
+        print(tabulate([['accuracy:'] + [f'{np.mean(v)/k:.2f}' for k,v in res_per_num_facts.items()]], headers=['num facts:'] + [f'{k}' for k in res_per_num_facts.keys()] , tablefmt='pretty'))
+
+    finally:
+        # Cleanup memory
+        if 'model' in locals(): del model
+        if 'tokenizer' in locals(): del tokenizer
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 if __name__ == '__main__':
@@ -205,11 +224,11 @@ if __name__ == '__main__':
     
     # List of models to run
     models_to_run = [
-        'state-spaces/mamba2-370m',
-        'state-spaces/mamba2-780m',
-        'state-spaces/mamba2-1.3b',
-        'state-spaces/mamba2-2.7b',
-        'EleutherAI/gpt-neo-2.7B'
+        # 'state-spaces/mamba2-370m',
+        # 'state-spaces/mamba2-780m',
+        # 'state-spaces/mamba2-1.3b',
+        # 'state-spaces/mamba2-2.7b',
+        'state-spaces/transformerpp-2.7b'
     ]
     
     start_datetime_str = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")

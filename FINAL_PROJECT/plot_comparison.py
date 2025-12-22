@@ -24,47 +24,85 @@ def plot_all_results():
         'mamba2-2.7b': 'red',
         'gpt-neo-2.7b': 'grey',
         'gpt-neo-2.7B': 'grey',
-        'transformer-2.7b': 'grey'
+        'transformer-2.7b': 'grey',
+        'transformerpp-2.7b': 'grey'
     }
     fallback_colors = ['cyan', 'magenta', 'yellow', 'black']
 
-    print(f"Found {len(result_files)} experiments. Plotting...")
+    print(f"Found {len(result_files)} experiments. Filtering for latest runs...")
 
-    for idx, file_path in enumerate(result_files):
-        # Extract model name from the folder name
+    # Dictionary to store the latest file for each unique model
+    # Key: standardized model name, Value: (timestamp, file_path)
+    latest_runs = {}
+
+    for file_path in result_files:
         folder_name = os.path.basename(os.path.dirname(file_path))
-        # Folder format is: DATE_TIME_MODELNAME
-        # We want just the MODELNAME part (everything after the last underscore of the date)
-        # Example: 2025_12_19__14_41_02_mamba2-370m -> mamba2-370m
+        
+        # Extract timestamp and model name
+        # Folder format: YYYY_MM_DD__HH_MM_SS_modelname
         try:
-            # heuristic: splitting by fixed date format length
-            model_name = folder_name[21:]
-            # Remove seeds suffix if present
-            if '_seeds' in model_name:
-                model_name = model_name.split('_seeds')[0]
+            # The timestamp is the first 20 chars: "YYYY_MM_DD__HH_MM_SS"
+            timestamp_str = folder_name[:20]
+            model_part = folder_name[21:]
             
-            # Prettify labels to match user image
-            name_lower = model_name.lower()
+            # Remove seeds suffix if present
+            if '_seeds' in model_part:
+                model_part = model_part.split('_seeds')[0]
+            
+            # Standardize model name for grouping
+            name_lower = model_part.lower()
+
+            # Skip pythia as requested
+            if 'pythia' in name_lower:
+                continue
+                
+            # STRICT FILTER: Only allow transformerpp-2.7b as the transformer
+            # If it's a transformer (gpt-neo, transformer-2.7b, etc) but NOT transformerpp, skip it.
+            if ('gpt-neo' in name_lower) or ('transformer' in name_lower and 'transformerpp' not in name_lower):
+                 continue
+
+            standard_name = model_part # Default
+            
+            # Map to canonical names
             known_names = {
                 'gpt-neo-2.7b': 'Transformer-2.7B',
+                'transformerpp-2.7b': 'Transformer++ 2.7B',
                 'mamba2-370m': 'Mamba2-370M',
                 'mamba2-780m': 'Mamba2-780M',
                 'mamba2-1.3b': 'Mamba2-1.3B',
                 'mamba2-2.7b': 'Mamba2-2.7B'
             }
-            # key matching
+            
             for k, v in known_names.items():
                 if k in name_lower:
-                    model_name = v
+                    standard_name = v
                     break
-        except:
-            model_name = folder_name
+            
+            # Simple string comparison for timestamps works because format is YYYY_MM_DD...
+            if standard_name not in latest_runs:
+                latest_runs[standard_name] = (timestamp_str, file_path)
+            else:
+                current_latest_ts = latest_runs[standard_name][0]
+                if timestamp_str > current_latest_ts:
+                    latest_runs[standard_name] = (timestamp_str, file_path)
+                    
+        except Exception as e:
+            print(f"Skipping malformed folder name: {folder_name} ({e})")
+            continue
 
+    print(f"Plotting {len(latest_runs)} unique models: {list(latest_runs.keys())}")
+
+    for idx, (model_name, (_, file_path)) in enumerate(latest_runs.items()):
+        
         with open(file_path, 'r') as f:
             data = json.load(f)
 
         # Sort by number of facts (keys are strings in JSON, need int)
-        x_values = sorted([int(k) for k in data.keys()])
+        x_values = sorted([int(k) for k in data.keys() if len(data[str(k)]) > 0], key=lambda x: int(x))
+        if not x_values:
+            print(f"Skipping {model_name} - no data found")
+            continue
+            
         # Calculate accuracy (sum / k)
         y_values = [np.mean(data[str(k)])/k for k in x_values]
 
