@@ -1,9 +1,15 @@
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+import warnings
+warnings.filterwarnings("ignore")
 try:
     from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 except ImportError:
-    from submodules.mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+    try:
+        from submodules.mamba.mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+    except ImportError:
+        MambaLMHeadModel = None
+        print("MambaLMHeadModel could not be imported. Mamba models will not run.")
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, GPTNeoXForCausalLM
@@ -14,6 +20,8 @@ from tqdm import tqdm
 from tabulate import tabulate
 import re
 import gc
+import traceback
+import json
 
 from utils import *
 
@@ -84,7 +92,27 @@ def run_ar_experiment(config, start_datetime_str):
         # For now, we remove it to fix the TypeError.
         model = MambaLMHeadModel.from_pretrained(model_name).to(torch.float16).to(config["device"])
     else:
-        model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16).to(config["device"])
+        # Added trust_remote_code=True to support custom models like Transformer++
+        # Added low_cpu_mem_usage=True to avoid OOM on smaller instances (requires accelerate)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16, trust_remote_code=True, low_cpu_mem_usage=True).to(config["device"])
+        except (ValueError, ImportError) as e:
+            if 'transformerpp' in model_name:
+                print(f"AutoModel failed ({e}). Attempting fallback classes...")
+                try:
+                    print("--> Trying GPTNeoXForCausalLM with use_safetensors=True...")
+                    model = GPTNeoXForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16, use_safetensors=True, low_cpu_mem_usage=True).to(config["device"])
+                except Exception as e_neox:
+                    print(f"GPTNeoX failed: {e_neox}")
+                    print("--> Trying LlamaForCausalLM with use_safetensors=True...")
+                    try:
+                        from transformers import LlamaForCausalLM
+                        model = LlamaForCausalLM.from_pretrained(model_name, cache_dir=config['cache_dir'], torch_dtype=torch.float16, use_safetensors=True, low_cpu_mem_usage=True).to(config["device"])
+                    except Exception as e_llama:
+                        print(f"Llama fallback also failed: {e_llama}")
+                        raise e # Raise original error if both fail
+            else:
+                raise e
         model.eval()
 
     seeds = [123,234,345,456,567]
@@ -228,7 +256,8 @@ if __name__ == '__main__':
         # 'state-spaces/mamba2-780m',
         # 'state-spaces/mamba2-1.3b',
         # 'state-spaces/mamba2-2.7b',
-        'state-spaces/transformerpp-2.7b'
+        # 'state-spaces/transformerpp-2.7b'
+        'EleutherAI/gpt-neo-2.7B'
     ]
     
     start_datetime_str = datetime.now().strftime("%Y_%m_%d__%H_%M_%S")
@@ -242,11 +271,20 @@ if __name__ == '__main__':
         print(f"\n\n==================================================")
         print(f"STARTING EXPERIMENT FOR: {model_name}")
         print(f"==================================================\n")
+        print(f"==================================================\n")
+        
+        if not os.path.exists('./ar_data.csv'):
+            print("ERROR: ar_data.csv not found in current directory! Please upload it.")
+            continue
+            
         try:
             run_ar_experiment(config, start_datetime_str)
         except Exception as e:
-            print(f"FAILED for {model_name}: {e}")
-            import traceback
+            error_msg = f"FAILED for {model_name}: {e}\n"
+            print(error_msg)
+            with open("experiment_errors.log", "a") as f:
+                f.write(f"[{datetime.now()}] {error_msg}")
+                f.write(traceback.format_exc() + "\n")
             traceback.print_exc()
 
     # Generate the comparison graph automatically

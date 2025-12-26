@@ -22,10 +22,9 @@ def plot_all_results():
         'mamba2-780m': 'green',
         'mamba2-1.3b': 'orange',
         'mamba2-2.7b': 'red',
-        'gpt-neo-2.7b': 'grey',
-        'gpt-neo-2.7B': 'grey',
-        'transformer-2.7b': 'grey',
-        'transformerpp-2.7b': 'grey'
+        'gpt-neo': 'grey',
+        'transformer': 'grey',
+        'transformer++': 'grey'
     }
     fallback_colors = ['cyan', 'magenta', 'yellow', 'black']
 
@@ -54,12 +53,18 @@ def plot_all_results():
 
             # Skip pythia as requested
             if 'pythia' in name_lower:
+                print(f"[SKIP] {folder_name}: Contains 'pythia'")
                 continue
                 
-            # STRICT FILTER: Only allow transformerpp-2.7b as the transformer
-            # If it's a transformer (gpt-neo, transformer-2.7b, etc) but NOT transformerpp, skip it.
-            if ('gpt-neo' in name_lower) or ('transformer' in name_lower and 'transformerpp' not in name_lower):
-                 continue
+            # STRICT FILTER: 
+            # 1. Ban GPT-Neo - ALLOWED NOW
+            # if 'gpt-neo' in name_lower:
+            #     print(f"[SKIP] {folder_name}: Contains 'gpt-neo' (Banned)")
+            #     continue
+            # 2. Ban generic "transformer" if it's not the new "transformerpp"
+            if 'transformer' in name_lower and 'pp' not in name_lower:
+                print(f"[SKIP] {folder_name}: Generic 'transformer' without 'pp' (Banned)")
+                continue
 
             standard_name = model_part # Default
             
@@ -78,17 +83,31 @@ def plot_all_results():
                     standard_name = v
                     break
             
+            print(f"Checking folder: {folder_name}")
+            
             # Simple string comparison for timestamps works because format is YYYY_MM_DD...
             if standard_name not in latest_runs:
                 latest_runs[standard_name] = (timestamp_str, file_path)
+                print(f"  -> Added as new latest for {standard_name}")
             else:
                 current_latest_ts = latest_runs[standard_name][0]
                 if timestamp_str > current_latest_ts:
                     latest_runs[standard_name] = (timestamp_str, file_path)
+                    print(f"  -> Updated latest for {standard_name}")
+                else:
+                    print(f"  -> Old run, skipping (current latest: {current_latest_ts})")
                     
         except Exception as e:
             print(f"Skipping malformed folder name: {folder_name} ({e})")
             continue
+
+    # Check for missing transformerpp results and warn the user
+    if 'Transformer++ 2.7B' not in latest_runs:
+        print("\n" + "!"*60)
+        print("WARNING: Transformer++ results (state-spaces/transformerpp-2.7b) NOT found.")
+        print("The graph cannot plot it because the experiment hasn't finished (or started) for this model yet.")
+        print("Please run the experiment script: python ar_experiment_proj.py")
+        print("!"*60 + "\n")
 
     print(f"Plotting {len(latest_runs)} unique models: {list(latest_runs.keys())}")
 
